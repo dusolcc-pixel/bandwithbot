@@ -7,10 +7,11 @@ import queue
 import tempfile
 import threading
 import time
+
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -26,27 +27,33 @@ from telegram.ext import (
 
 BOT_TOKEN = "9252491638:AAGKzMo27aNlZtRUAcIvt-QUgFWM_fnX3qk"
 
-DEFAULT_CONNECTIONS = 8
+CONNECTIONS = 8
+
+# ZERO = UNLIMITED
+
+SPEED_LIMIT = 0       # MB/s
+MAX_DATA = 0          # GB
+MAX_RUNTIME = 0       # Minutes
+
 MAX_CONNECTIONS = 16
 
-# 0 = Unlimited
-SPEED_LIMIT_MB = 0
-
-MAX_RUNTIME = 0
-MAX_DATA = 0
-
 CHUNK_SIZE = 256 * 1024
+
+RETRY_DELAY = 3
+
+DASHBOARD_REFRESH = 3
 
 # ==========================================
 # GLOBAL VARIABLES
 # ==========================================
 
 lock = threading.RLock()
-stop_event = threading.Event()
-error_queue = queue.Queue()
+rate_lock = threading.Lock()
 
-connections = DEFAULT_CONNECTIONS
-speed_limit = SPEED_LIMIT_MB
+stop_event = threading.Event()
+run_gate = threading.Event()
+
+error_queue = queue.Queue()
 
 stats = {
     "bytes": 0,
@@ -55,6 +62,7 @@ stats = {
     "errors": 0,
     "speed": 0,
     "running": False,
+    "paused": False,
     "start": None,
     "elapsed": 0,
     "url": "",
@@ -62,32 +70,44 @@ stats = {
 
 waiting_for_url = set()
 dashboard_messages = {}
+
 alert_chat_id = None
+error_notified = False
+
+temp_dir = None
+worker_threads = []
 
 
 # ==========================================
-# UTILITIES
+# HELPERS
 # ==========================================
 
 def human(n):
+
     for unit in ("B", "KB", "MB", "GB", "TB"):
+
         if n < 1024:
             return f"{n:.2f} {unit}"
+
         n /= 1024
 
     return f"{n:.2f} PB"
 
 
 def duration(seconds):
+
     seconds = max(0, int(seconds))
+
     h, r = divmod(seconds, 3600)
     m, s = divmod(r, 60)
 
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def get_elapsed():
+def current_elapsed():
+
     with lock:
+
         if stats["running"]:
             return time.monotonic() - stats["start"]
 
@@ -95,135 +115,216 @@ def get_elapsed():
 
 
 # ==========================================
-# TELEGRAM DASHBOARD
+# DASHBOARD
 # ==========================================
 
 def dashboard():
 
     with lock:
-        running = stats["running"]
+
         total = stats["bytes"]
         completed = stats["completed"]
         deleted = stats["deleted"]
         errors = stats["errors"]
+
         speed = stats["speed"]
+
+        running = stats["running"]
+        paused = stats["paused"]
+
         url = stats["url"]
 
-        conn = connections
-        limit = speed_limit
+        conn = CONNECTIONS
+        speed_limit = SPEED_LIMIT
+        max_data = MAX_DATA
+        max_time = MAX_RUNTIME
 
-    status = "🟢 RUNNING" if running else "⚪ STOPPED"
+    if paused:
+        status = "⏸ PAUSED"
 
-    limit_text = (
-        f"{limit} MB/s"
-        if limit > 0
-        else "Unlimited"
+    elif running:
+        status = "🟢 RUNNING"
+
+    else:
+        status = "⚪ STOPPED"
+
+    speed_text = (
+        f"{speed_limit} MB/s"
+        if speed_limit else "Unlimited"
+    )
+
+    data_text = (
+        f"{max_data} GB"
+        if max_data else "Unlimited"
+    )
+
+    time_text = (
+        f"{max_time} minutes"
+        if max_time else "Unlimited"
     )
 
     url_text = html.escape(url[:65]) if url else "Not selected"
 
     return (
         "📊 <b>BANDWIDTH DASHBOARD</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        f"Status: {status}\n"
-        f"⏱ Time: {duration(get_elapsed())}\n"
+        f"Status: <b>{status}</b>\n"
+        f"⏱ Duration: {duration(current_elapsed())}\n"
         f"📥 Bandwidth: {human(total)}\n"
         f"🚀 Speed: {human(speed)}/s\n\n"
 
-        "━━━━━━━━━━━━━━━━━━\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
 
-        f"✅ Downloads: {completed}\n"
+        f"✅ Completed downloads: {completed}\n"
         f"🗑 Deleted files: {deleted}\n"
         f"⚠️ Errors: {errors}\n\n"
 
-        "━━━━━━━━━━━━━━━━━━\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
 
         f"🔗 URL: <code>{url_text}</code>\n"
         f"🔌 Connections: {conn}\n"
-        f"⚡ Speed limit: {limit_text}\n\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-
-        f"Maximum time: {duration(MAX_RUNTIME)}\n"
-        f"Maximum data: {human(MAX_DATA)}"
+        f"⚡ Speed limit: {speed_text}\n"
+        f"📦 Data limit: {data_text}\n"
+        f"⏳ Runtime limit: {time_text}"
     )
 
 
 def main_keyboard():
 
     return InlineKeyboardMarkup([
+
         [
             InlineKeyboardButton(
                 "▶ New Download",
                 callback_data="new"
             ),
+
             InlineKeyboardButton(
                 "⏹ Stop",
                 callback_data="stop"
             ),
         ],
+
         [
+            InlineKeyboardButton(
+                "▶ Resume",
+                callback_data="resume"
+            ),
+
             InlineKeyboardButton(
                 "⚙ Settings",
                 callback_data="settings"
             ),
+        ],
+
+        [
             InlineKeyboardButton(
                 "🔄 Refresh",
                 callback_data="refresh"
             ),
         ],
-    ])
 
-
-def settings_keyboard():
-
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "4 Connections",
-                callback_data="conn:4"
-            ),
-            InlineKeyboardButton(
-                "8 Connections",
-                callback_data="conn:8"
-            ),
-            InlineKeyboardButton(
-                "16 Connections",
-                callback_data="conn:16"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "1 MB/s",
-                callback_data="speed:1"
-            ),
-            InlineKeyboardButton(
-                "5 MB/s",
-                callback_data="speed:5"
-            ),
-            InlineKeyboardButton(
-                "10 MB/s",
-                callback_data="speed:10"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "Unlimited",
-                callback_data="speed:0"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅ Dashboard",
-                callback_data="dashboard"
-            ),
-        ],
     ])
 
 
 # ==========================================
-# DOWNLOAD ENGINE
+# SETTINGS
+# ==========================================
+
+def settings_text():
+
+    return (
+        "⚙ <b>DOWNLOAD SETTINGS</b>\n\n"
+
+        f"Connections: {CONNECTIONS}\n"
+        f"Speed: {SPEED_LIMIT or 'Unlimited'} MB/s\n"
+        f"Data: {MAX_DATA or 'Unlimited'} GB\n"
+        f"Runtime: {MAX_RUNTIME or 'Unlimited'} minutes\n\n"
+
+        "<b>Commands</b>\n\n"
+
+        "/connections 8\n"
+        "/connections 16\n"
+        "/speed 10\n"
+        "/speed 0\n"
+        "/maxdata 5\n"
+        "/maxdata 0\n"
+        "/maxtime 60\n"
+        "/maxtime 0"
+    )
+
+
+# ==========================================
+# URL VALIDATION
+# ==========================================
+
+def valid_url(url):
+
+    try:
+
+        parsed = urlparse(url)
+
+        return (
+            parsed.scheme in ("http", "https")
+            and bool(parsed.netloc)
+        )
+
+    except Exception:
+
+        return False
+
+
+# ==========================================
+# GLOBAL SPEED LIMITER
+# ==========================================
+
+def throttle_download(size):
+
+    with rate_lock:
+
+        limit = SPEED_LIMIT
+
+        if limit <= 0:
+            return
+
+        delay = size / (limit * 1024 * 1024)
+
+    if delay > 0:
+        stop_event.wait(delay)
+
+
+# ==========================================
+# PAUSE ON ERROR
+# ==========================================
+
+def pause_download(error):
+
+    global error_notified
+
+    with lock:
+
+        if not stats["running"]:
+            return
+
+        stats["paused"] = True
+        stats["errors"] += 1
+
+        if not error_notified:
+
+            error_notified = True
+
+            error_queue.put(
+                "Download interrupted.\n"
+                "Reason: " + str(error)[:250] + "\n\n"
+                "All workers have been paused."
+            )
+
+    run_gate.clear()
+
+
+# ==========================================
+# DOWNLOAD WORKER
 # ==========================================
 
 def worker(number, directory, url):
@@ -239,14 +340,17 @@ def worker(number, directory, url):
 
     while not stop_event.is_set():
 
+        # Wait until started or resumed.
+
+        while not run_gate.wait(0.5):
+
+            if stop_event.is_set():
+                return
+
+        if stop_event.is_set():
+            break
+
         try:
-
-            with lock:
-                remaining = MAX_DATA - stats["bytes"]
-
-            if remaining <= 0:
-                stop_event.set()
-                break
 
             req = Request(
                 url,
@@ -259,20 +363,55 @@ def worker(number, directory, url):
 
                     while not stop_event.is_set():
 
-                        with lock:
-                            remaining = MAX_DATA - stats["bytes"]
-
-                        if remaining <= 0:
-                            stop_event.set()
+                        if not run_gate.is_set():
                             break
+
+                        with lock:
+
+                            current_bytes = stats["bytes"]
+
+                            data_limit = MAX_DATA
+                            time_limit = MAX_RUNTIME
+
+                            started = stats["start"]
+
+                        # Data limit: 0 means unlimited.
+
+                        if data_limit > 0:
+
+                            max_bytes = data_limit * 1024**3
+
+                            if current_bytes >= max_bytes:
+
+                                stop_download()
+                                return
+
+                            remaining = max_bytes - current_bytes
+
+                        else:
+
+                            remaining = CHUNK_SIZE
+
+                        # Runtime limit: 0 means unlimited.
+
+                        if time_limit > 0:
+
+                            elapsed = time.monotonic() - started
+
+                            if elapsed >= time_limit * 60:
+
+                                stop_download()
+                                return
 
                         data = response.read(
                             min(CHUNK_SIZE, remaining)
                         )
 
                         if not data:
+
                             with lock:
                                 stats["completed"] += 1
+
                             break
 
                         file.write(data)
@@ -280,35 +419,17 @@ def worker(number, directory, url):
                         with lock:
                             stats["bytes"] += len(data)
 
-                        # Aggregate speed limiting
-                        with lock:
-                            limit = speed_limit
-                            started = stats["start"]
-
-                        if limit > 0:
-                            allowed = (
-                                limit * 1024 * 1024
-                                * (time.monotonic() - started)
-                            )
-
-                            while (
-                                stats["bytes"] > allowed + CHUNK_SIZE
-                                and not stop_event.is_set()
-                            ):
-                                stop_event.wait(0.1)
+                        throttle_download(len(data))
 
         except Exception as error:
 
             if not stop_event.is_set():
 
-                with lock:
-                    stats["errors"] += 1
+                pause_download(error)
 
-                error_queue.put(
-                    f"Worker {number}: {type(error).__name__}: {error}"
-                )
+                # Stay paused until manual resume or stop.
 
-                stop_event.wait(3)
+                continue
 
         finally:
 
@@ -321,20 +442,19 @@ def worker(number, directory, url):
                     with lock:
                         stats["deleted"] += 1
 
-            except OSError as error:
-
-                error_queue.put(
-                    f"File deletion failed: {error}"
-                )
+            except OSError:
+                pass
 
 
 # ==========================================
-# START / STOP
+# START DOWNLOAD
 # ==========================================
 
 def start_download(url):
 
     global temp_dir
+    global worker_threads
+    global error_notified
 
     with lock:
 
@@ -342,48 +462,62 @@ def start_download(url):
             return False
 
         stats.update({
+
             "bytes": 0,
             "completed": 0,
             "deleted": 0,
             "errors": 0,
             "speed": 0,
+
             "running": True,
+            "paused": False,
+
             "start": time.monotonic(),
             "elapsed": 0,
+
             "url": url,
+
         })
 
-        count = connections
+        count = CONNECTIONS
 
-    while True:
-        try:
-            error_queue.get_nowait()
-        except queue.Empty:
-            break
+    error_notified = False
 
     stop_event.clear()
+    run_gate.set()
 
     temp_dir = tempfile.mkdtemp(
         prefix="bandwidthbot_"
     )
 
-    for i in range(1, count + 1):
+    worker_threads = []
+
+    for number in range(1, count + 1):
 
         thread = threading.Thread(
+
             target=worker,
-            args=(i, temp_dir, url),
+
+            args=(
+                number,
+                temp_dir,
+                url
+            ),
+
             daemon=True
+
         )
 
         thread.start()
 
-    threading.Thread(
-        target=limit_watcher,
-        daemon=True
-    ).start()
+        worker_threads.append(thread)
 
     return True
 
+
+# ==========================================
+# STOP DOWNLOAD
+# ==========================================
 
 def stop_download():
 
@@ -397,36 +531,37 @@ def stop_download():
         )
 
         stats["running"] = False
+        stats["paused"] = False
 
     stop_event.set()
+    run_gate.set()
 
     return True
 
 
-def limit_watcher():
+# ==========================================
+# RESUME DOWNLOAD
+# ==========================================
 
-    while True:
+def resume_download():
 
-        time.sleep(0.5)
+    global error_notified
 
-        with lock:
+    with lock:
 
-            running = stats["running"]
+        if not stats["running"]:
+            return False
 
-            elapsed = (
-                time.monotonic() - stats["start"]
-                if running else 0
-            )
+        if not stats["paused"]:
+            return False
 
-            total = stats["bytes"]
+        stats["paused"] = False
 
-        if not running:
-            return
+    error_notified = False
 
-        if elapsed >= MAX_RUNTIME or total >= MAX_DATA:
+    run_gate.set()
 
-            stop_download()
-            return
+    return True
 
 
 # ==========================================
@@ -454,8 +589,7 @@ async def start_command(update, context):
 
     await update.message.reply_text(
         "🔗 <b>Send your download URL.</b>\n\n"
-        "The download will start automatically "
-        "after receiving the URL.",
+        "The download will start automatically.",
         parse_mode="HTML"
     )
 
@@ -471,12 +605,10 @@ async def receive_url(update, context):
 
     url = update.message.text.strip()
 
-    parsed = urlparse(url)
-
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    if not valid_url(url):
 
         await update.message.reply_text(
-            "❌ Invalid URL. Send a valid HTTP/HTTPS URL."
+            "❌ Invalid HTTP/HTTPS URL."
         )
 
         return
@@ -499,93 +631,6 @@ async def receive_url(update, context):
 
         dashboard_messages[chat_id] = message.message_id
 
-    else:
-
-        await update.message.reply_text(
-            "A download is already running."
-        )
-
-
-async def settings_command(update, context):
-
-    await update.message.reply_text(
-        "⚙ <b>DOWNLOAD SETTINGS</b>\n\n"
-        f"Connections: {connections}\n"
-        f"Speed limit: {speed_limit or 'Unlimited'} MB/s\n\n"
-        "Commands:\n"
-        "/connections 8\n"
-        "/speed 5\n"
-        "/speed 0",
-        parse_mode="HTML",
-        reply_markup=settings_keyboard()
-    )
-
-
-async def connections_command(update, context):
-
-    global connections
-
-    if not context.args:
-        await update.message.reply_text(
-            f"Current connections: {connections}"
-        )
-        return
-
-    try:
-        value = int(context.args[0])
-
-        if not 1 <= value <= MAX_CONNECTIONS:
-            raise ValueError
-
-    except ValueError:
-
-        await update.message.reply_text(
-            "Choose connections between 1 and 16."
-        )
-
-        return
-
-    connections = value
-
-    await update.message.reply_text(
-        f"✅ Connections changed to {value}.\n"
-        "Applies to the next download."
-    )
-
-
-async def speed_command(update, context):
-
-    global speed_limit
-
-    if not context.args:
-
-        await update.message.reply_text(
-            f"Current speed limit: {speed_limit or 'Unlimited'} MB/s"
-        )
-
-        return
-
-    try:
-
-        value = float(context.args[0])
-
-        if not 0 <= value <= 1000:
-            raise ValueError
-
-    except ValueError:
-
-        await update.message.reply_text(
-            "Enter a value between 0 and 1000."
-        )
-
-        return
-
-    speed_limit = value
-
-    await update.message.reply_text(
-        f"✅ Speed limit: {value or 'Unlimited'} MB/s"
-    )
-
 
 async def stop_command(update, context):
 
@@ -602,12 +647,160 @@ async def stop_command(update, context):
         )
 
 
+async def resume_command(update, context):
+
+    if resume_download():
+
+        await update.message.reply_text(
+            "▶️ Download resumed."
+        )
+
+    else:
+
+        await update.message.reply_text(
+            "Nothing is paused."
+        )
+
+
 async def stats_command(update, context):
 
     await update.message.reply_text(
         dashboard(),
         parse_mode="HTML",
         reply_markup=main_keyboard()
+    )
+
+
+async def settings_command(update, context):
+
+    await update.message.reply_text(
+        settings_text(),
+        parse_mode="HTML"
+    )
+
+
+# ==========================================
+# CHANGE CONNECTIONS
+# ==========================================
+
+async def connections_command(update, context):
+
+    global CONNECTIONS
+
+    try:
+
+        value = int(context.args[0])
+
+        if not 1 <= value <= MAX_CONNECTIONS:
+            raise ValueError
+
+    except (ValueError, IndexError):
+
+        await update.message.reply_text(
+            "Usage: /connections 8\n"
+            "Choose 1 to 16."
+        )
+
+        return
+
+    CONNECTIONS = value
+
+    await update.message.reply_text(
+        f"✅ Connections changed to {value}.\n"
+        "Applies to the next download."
+    )
+
+
+# ==========================================
+# CHANGE SPEED
+# ==========================================
+
+async def speed_command(update, context):
+
+    global SPEED_LIMIT
+
+    try:
+
+        value = float(context.args[0])
+
+        if not 0 <= value <= 1000:
+            raise ValueError
+
+    except (ValueError, IndexError):
+
+        await update.message.reply_text(
+            "Usage: /speed 10\n"
+            "/speed 0 = Unlimited"
+        )
+
+        return
+
+    SPEED_LIMIT = value
+
+    await update.message.reply_text(
+        f"✅ Speed limit: {value or 'Unlimited'} MB/s"
+    )
+
+
+# ==========================================
+# CHANGE DATA LIMIT
+# ==========================================
+
+async def maxdata_command(update, context):
+
+    global MAX_DATA
+
+    try:
+
+        value = float(context.args[0])
+
+        if value < 0:
+            raise ValueError
+
+    except (ValueError, IndexError):
+
+        await update.message.reply_text(
+            "Usage: /maxdata 5\n"
+            "/maxdata 0 = Unlimited"
+        )
+
+        return
+
+    MAX_DATA = value
+
+    await update.message.reply_text(
+        f"✅ Data limit: {value or 'Unlimited'} GB"
+    )
+
+
+# ==========================================
+# CHANGE RUNTIME LIMIT
+# ==========================================
+
+async def maxtime_command(update, context):
+
+    global MAX_RUNTIME
+
+    try:
+
+        value = float(context.args[0])
+
+        if value < 0:
+            raise ValueError
+
+    except (ValueError, IndexError):
+
+        await update.message.reply_text(
+            "Usage: /maxtime 60\n"
+            "/maxtime 0 = Unlimited"
+        )
+
+        return
+
+    MAX_RUNTIME = value
+
+    await update.message.reply_text(
+        f"✅ Runtime limit: {value or 'Unlimited'} minutes"
     )
 
 
@@ -645,30 +838,18 @@ async def button_handler(update, context):
 
         stop_download()
 
+    elif query.data == "resume":
+
+        resume_download()
+
     elif query.data == "settings":
 
         await query.message.reply_text(
-            "⚙ Settings",
-            reply_markup=settings_keyboard()
+            settings_text(),
+            parse_mode="HTML"
         )
 
         return
-
-    elif query.data.startswith("conn:"):
-
-        global connections
-
-        connections = int(
-            query.data.split(":")[1]
-        )
-
-    elif query.data.startswith("speed:"):
-
-        global speed_limit
-
-        speed_limit = float(
-            query.data.split(":")[1]
-        )
 
     try:
 
@@ -678,14 +859,12 @@ async def button_handler(update, context):
             reply_markup=main_keyboard()
         )
 
-        dashboard_messages[chat_id] = query.message.message_id
-
     except Exception:
         pass
 
 
 # ==========================================
-# LIVE DASHBOARD
+# DASHBOARD REFRESH
 # ==========================================
 
 async def dashboard_loop(application):
@@ -695,7 +874,7 @@ async def dashboard_loop(application):
 
     while True:
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(DASHBOARD_REFRESH)
 
         now = time.monotonic()
 
@@ -707,7 +886,7 @@ async def dashboard_loop(application):
                 current_bytes - previous_bytes
             ) / max(0.001, now - previous_time)
 
-            if not stats["running"]:
+            if not stats["running"] or stats["paused"]:
                 stats["speed"] = 0
 
         previous_bytes = current_bytes
@@ -722,19 +901,25 @@ async def dashboard_loop(application):
             try:
 
                 await application.bot.edit_message_text(
+
                     chat_id=chat_id,
+
                     message_id=message_id,
+
                     text=text,
+
                     parse_mode="HTML",
+
                     reply_markup=main_keyboard()
+
                 )
 
             except Exception:
-                dashboard_messages.pop(chat_id, None)
+                pass
 
 
 # ==========================================
-# INTERRUPTION ALERTS
+# CONSOLIDATED ERROR NOTIFICATION
 # ==========================================
 
 async def alert_loop(application):
@@ -743,39 +928,38 @@ async def alert_loop(application):
 
         await asyncio.sleep(1)
 
-        messages = []
+        try:
 
-        while True:
+            message = error_queue.get_nowait()
 
-            try:
-                messages.append(
-                    error_queue.get_nowait()
-                )
+        except queue.Empty:
+            continue
 
-            except queue.Empty:
-                break
-
-        if messages and alert_chat_id:
-
-            text = (
-                "⚠️ <b>DOWNLOAD INTERRUPTION</b>\n\n"
-                + "\n".join(
-                    "• " + html.escape(msg[:250])
-                    for msg in messages[:5]
-                )
-            )
+        if alert_chat_id:
 
             try:
 
                 await application.bot.send_message(
+
                     chat_id=alert_chat_id,
-                    text=text,
+
+                    text=(
+                        "⚠️ <b>DOWNLOAD PAUSED</b>\n\n"
+                        + html.escape(message)
+                        + "\n\nUse /resume after checking the problem."
+                    ),
+
                     parse_mode="HTML"
+
                 )
 
             except Exception:
                 pass
 
+
+# ==========================================
+# STARTUP
+# ==========================================
 
 async def post_init(application):
 
@@ -788,27 +972,40 @@ async def post_init(application):
     )
 
 
-# ==========================================
-# MAIN
-# ==========================================
-
 def main():
 
     if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
 
         raise SystemExit(
-            "Please add your Telegram bot token."
+            "Please configure BOT_TOKEN."
         )
 
     application = (
+
         Application.builder()
+
         .token(BOT_TOKEN)
+
         .post_init(post_init)
+
         .build()
+
     )
 
     application.add_handler(
         CommandHandler("start", start_command)
+    )
+
+    application.add_handler(
+        CommandHandler("stop", stop_command)
+    )
+
+    application.add_handler(
+        CommandHandler("resume", resume_command)
+    )
+
+    application.add_handler(
+        CommandHandler("stats", stats_command)
     )
 
     application.add_handler(
@@ -824,11 +1021,11 @@ def main():
     )
 
     application.add_handler(
-        CommandHandler("stop", stop_command)
+        CommandHandler("maxdata", maxdata_command)
     )
 
     application.add_handler(
-        CommandHandler("stats", stats_command)
+        CommandHandler("maxtime", maxtime_command)
     )
 
     application.add_handler(
