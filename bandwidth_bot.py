@@ -24,7 +24,7 @@ from telegram.ext import (
 # CONFIGURATION
 # ==========================================
 
-BOT_TOKEN = "9252491638:AAHFrIGAeAGEtdn2w4JZMkutTGTBEYgn7Wk"
+BOT_TOKEN = "9252491638:AAGKzMo27aNlZtRUAcIvt-QUgFWM_fnX3qk"
 
 DEFAULT_CONNECTIONS = 8
 MAX_CONNECTIONS = 16
